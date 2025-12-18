@@ -19,11 +19,9 @@ dependencies = [
 ]
 
 [tool.ruff]
-line-length = 88
+line-length = 210
 target-version = "py312"
 extend-select = ["E", "F", "W", "C90", "I"]
+extend-ignore = ["C901"]
 exclude = ["docs", ".venv", "build", "dist"]
 
-[tool.ruff]
-line-length = 88
-exclude = [".venv", "venv"]

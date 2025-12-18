@@ -11,4 +11,4 @@ repos:
         name: pytest (run on push)
         entry: pytest -q
         language: system
-        stages: [push]
+        stages: [commit]
