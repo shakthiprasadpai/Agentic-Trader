@@ -5,6 +5,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![OpenAI Agents SDK](https://img.shields.io/badge/OpenAI-Agents%20SDK-green.svg)](https://openai.github.io/openai-agents-python/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Check environment](https://github.com/marketcalls/Agentic-Trader/actions/workflows/check-env.yml/badge.svg)](https://github.com/marketcalls/Agentic-Trader/actions/workflows/check-env.yml)
 
 An autonomous AI trading agent that analyzes technical indicators in real-time, makes intelligent BUY/SELL/HOLD decisions, and executes trades automatically on the NSE (National Stock Exchange of India).
 
@@ -415,6 +416,12 @@ PRODUCT = "MIS"                   # Intraday trading
 ```bash
 uv sync
 uv pip install --upgrade openai-agents
+```
+
+**Quick environment check**: Run the automated checker to validate installed packages and imports:
+
+```bash
+python scripts/check_env.py
 ```
 
 #### 2. TA-Lib Import Error
