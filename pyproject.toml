@@ -17,3 +17,13 @@ dependencies = [
     "ta-lib>=0.4.28",
     "aiosqlite>=0.19.0",
 ]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+extend-select = ["E", "F", "W", "C90", "I"]
+exclude = ["docs", ".venv", "build", "dist"]
+
+[tool.ruff]
+line-length = 88
+exclude = [".venv", "venv"]

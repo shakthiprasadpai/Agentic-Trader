@@ -500,10 +500,13 @@ source .venv/bin/activate  # Linux/Mac
 # Install dependencies
 uv sync
 
+# Install and enable developer pre-commit hooks (recommended)
+python -m pip install --upgrade pre-commit
+pre-commit install
+
 # Run tests (if available)
 uv run pytest
 ```
-
 ---
 
 ## License

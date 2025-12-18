@@ -1,0 +1,14 @@
+repos:
+  - repo: https://github.com/charliermarsh/ruff-pre-commit
+    rev: v0.14.9
+    hooks:
+      - id: ruff
+        args: ["--fix", "--quiet"]
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (run on push)
+        entry: pytest -q
+        language: system
+        stages: [push]

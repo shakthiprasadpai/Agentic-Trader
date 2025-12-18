@@ -37,6 +37,12 @@ PY
         run: |
           python scripts/check_env.py
 
+      - name: Install pre-commit
+        run: python -m pip install --upgrade pre-commit
+
+      - name: Run pre-commit (auto-fix staged files)
+        run: pre-commit run --all-files || true
+
       - name: Install dev tools (lint/test)
         run: python -m pip install --upgrade ruff pytest
 
