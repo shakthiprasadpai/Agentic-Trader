@@ -31,6 +31,15 @@ if pkgs:
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', *pkgs])
 else:
     print('No dependencies found in pyproject.toml')
+
+# Install optional dev/test dependencies if present
+opt = py.get('project', {}).get('optional-dependencies', {})
+dev = opt.get('dev', [])
+if dev:
+    print('Installing dev dependencies:', dev)
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', *dev])
+else:
+    print('No dev dependencies found in pyproject.toml')
 PY
 
       - name: Run environment checker

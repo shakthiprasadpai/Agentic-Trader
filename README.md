@@ -182,6 +182,29 @@ ITC: HOLD (mixed signals)
 ================================================================================
 ```
 
+## Risk Management
+
+The project includes robust, configurable risk controls to manage per-trade and portfolio level risk.
+
+- **Percent-based sizing** — use `RISK_PER_TRADE_PERCENT` (default `0.01`) to risk a percentage of account equity per trade.
+- **ATR stop-loss** — `ATR_MULTIPLIER` (default `3`) is used to calculate an ATR-based stop-loss when historical data is available.
+- **Per-symbol exposure cap** — `MAX_INVESTMENT_PER_TRADE` caps investment per trade (default ₹10,000).
+- **Portfolio exposure cap** — `MAX_PORTFOLIO_EXPOSURE_PERCENT` (default `0.2`) limits total invested capital relative to account equity.
+- **Trailing stops (new)** — optional trailing stop support via `TRAILING_STOP_PERCENT` (e.g., `0.03` = 3%). Use `TRAILING_STOP_ENABLED=true` to enable automatic trailing stop updates and management.
+
+Implementation notes:
+- `risk.py` contains helpers: `compute_atr_stoploss`, `compute_position_size_by_risk`, and `enforce_exposure_limits`.
+- `calculate_position_size` falls back to simple `int(max_investment / ltp)` when risk sizing is disabled or historical data is unavailable.
+- `check_risk_constraints` enforces daily stop-loss, per-symbol trade limits, exposure checks, and market close restrictions.
+
+Configuration example (in `.env`):
+
+```
+RISK_PER_TRADE_PERCENT=0.01
+MAX_PORTFOLIO_EXPOSURE_PERCENT=0.2
+ATR_MULTIPLIER=3
+```
+
 ---
 
 ## Installation

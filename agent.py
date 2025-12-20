@@ -3,9 +3,9 @@ OpenAlgo Autonomous AI Trading Agent
 Self-learning agent that makes data-driven trading decisions
 """
 
-import sys
 import io
 import os
+import sys
 
 # Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress INFO and WARNING messages
@@ -16,23 +16,84 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-from agents.agent import Agent
-from agents.run import Runner
-from agents.tool import function_tool
-from agents.extensions.models.litellm_model import LitellmModel
-from agents.extensions.memory.sqlalchemy_session import SQLAlchemySession
-from openalgo import api
-from dotenv import load_dotenv
+from pathlib import Path
+
+# Add current directory to path for local imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Import core modules with fallback chain
+function_tool = None
+Agent = None
+Runner = None
+LitellmModel = None
+
+try:
+    # Try relative imports first (when running as a package)
+    from agent import Agent
+    from run import Runner # type: ignore
+    
+    from tool import function_tool # type: ignore
+except ImportError:
+    pass
+
+try:
+    from extensions.models.litellm_model import LitellmModel # type: ignore
+except ImportError:
+    try:
+        from .extensions.models.litellm_model import LitellmModel # type: ignore
+    except ImportError:
+        try:
+            # Fallback to absolute imports when running as a top-level script
+            from agents.agent import Agent
+            from agents.run import Runner
+            from agents.tool import function_tool
+            from agents.extensions.models.litellm_model import LitellmModel
+        except ImportError:
+            try:
+                # Try importing from current directory as standalone modules
+                import importlib.util
+                tool_spec = importlib.util.spec_from_file_location("tool", str(Path(__file__).parent / "tool.py"))
+                if tool_spec and tool_spec.loader:
+                    tool_module = importlib.util.module_from_spec(tool_spec)
+                    tool_spec.loader.exec_module(tool_module)
+                    function_tool = tool_module.function_tool
+                else:
+                    raise ImportError("Could not load tool module")
+            except ImportError as e:
+                print(f"Warning: Could not import core modules: {e}")
+                raise
+
+# Verify critical imports
+if function_tool is None:
+    raise ImportError("Failed to import function_tool from tool module")
+if Agent is None:
+    raise ImportError("Failed to import Agent from agent module")
+if Runner is None:
+    raise ImportError("Failed to import Runner from run module")
+if LitellmModel is None:
+    raise ImportError("Failed to import LitellmModel from extensions.models.litellm_model")
 import asyncio
+import json
 import os
 from datetime import datetime, timedelta
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import pytz
-from typing import Dict, Any, List
-import json
-from colorama import Fore, Back, Style, init
-import talib
+from typing import Any, Dict
+
 import numpy as np
+import pytz
+import talib
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from colorama import Fore, Style, init
+from dotenv import load_dotenv
+from openalgo import api
+
+# Try to import new risk utilities (best-effort)
+try:
+    import risk
+except Exception:
+    try:
+        from . import risk
+    except Exception:
+        risk = None
 
 # Initialize colorama for Windows compatibility
 init(autoreset=True)
@@ -143,8 +204,8 @@ def get_all_market_data() -> Dict[str, Any]:
     Uses threading to fetch all symbols in parallel while respecting 10 req/sec limit.
     Much faster than sequential calls.
     """
-    import time
     import threading
+    import time
     from datetime import datetime, timedelta
 
     def fetch_symbol_data(symbol: str, results: dict, index: int):
@@ -182,8 +243,6 @@ def get_all_market_data() -> Dict[str, Any]:
                 ema_trend = "neutral"
             else:
                 close_prices = history_response['close'].values
-                high_prices = history_response['high'].values
-                low_prices = history_response['low'].values
 
                 rsi = talib.RSI(close_prices, timeperiod=14)
                 macd, macd_signal, _ = talib.MACD(close_prices, fastperiod=12, slowperiod=26, signalperiod=9)
@@ -320,7 +379,6 @@ def get_historical_data(symbol: str, lookback_bars: int = 5) -> Dict[str, Any]:
         close_prices = response['close'].values
         high_prices = response['high'].values
         low_prices = response['low'].values
-        volume = response['volume'].values
 
         # Calculate Technical Indicators using TA-Lib (full series first)
 
@@ -525,7 +583,10 @@ def calculate_all_position_sizes(positions: str) -> Dict[str, Any]:
                 "actual_investment": round(actual_investment, 2)
             })
 
-            print(f"{Fore.CYAN}  {symbol}: Qty={quantity}, Investment=Rs.{actual_investment:.2f}{Style.RESET_ALL}", flush=True)
+            print(
+                f"{Fore.CYAN}  {symbol}: Qty={quantity}, Investment=Rs.{actual_investment:.2f}{Style.RESET_ALL}",
+                flush=True
+            )
 
         return {"success": True, "results": results}
 
@@ -540,6 +601,11 @@ def calculate_position_size(symbol: str, ltp: float, max_investment: float = 100
     """Calculate the correct quantity of shares to buy based on LTP and max investment per trade.
 
     This tool MUST be used before placing any order to ensure correct position sizing.
+
+    Behavior:
+      - If environment variable `RISK_PER_TRADE_PERCENT` > 0, the function will compute an ATR-based stop-loss
+        and size the position using percent-of-equity risk sizing (preferred).
+      - Otherwise it falls back to simple `int(max_investment / ltp)` behavior to remain backwards compatible.
 
     Args:
         symbol: Stock symbol (e.g., "ICICIBANK", "WIPRO")
@@ -557,7 +623,68 @@ def calculate_position_size(symbol: str, ltp: float, max_investment: float = 100
                 "quantity": 0
             }
 
-        # Calculate quantity: int(max_investment / ltp)
+        # If risk-based sizing is enabled, compute ATR stop and size by risk-percent
+        risk_percent_env = float(os.getenv("RISK_PER_TRADE_PERCENT", "0"))
+        # Only use risk-based sizing if module is available
+        if risk_percent_env > 0 and (globals().get("risk") is not None):
+            # Get account snapshot
+            snapshot = get_account_snapshot()
+            available_cash = float(snapshot.get("available_cash", 0))
+
+            # Try to fetch history for ATR calculation (best-effort)
+            try:
+                end_date = datetime.now(IST).strftime("%Y-%m-%d")
+                start_date = (datetime.now(IST) - timedelta(days=3)).strftime("%Y-%m-%d")
+                history = client.history(symbol=symbol, exchange=EXCHANGE, interval="5m", start_date=start_date, end_date=end_date)
+                if isinstance(history, dict) and history.get("status") == "error":
+                    raise ValueError("history fetch error")
+
+                highs = history["high"].values
+                lows = history["low"].values
+                closes = history["close"].values
+
+                # Compute stop using ATR
+                stop_price_buy = None
+                try:
+                    stop_price_buy = risk.compute_atr_stoploss(highs, lows, closes, ltp, action="BUY")
+                except Exception:
+                    stop_price_buy = round(ltp * 0.98, 2)
+
+                # Compute quantity by risk
+                sizing = risk.compute_position_size_by_risk(ltp=ltp, stop_price=stop_price_buy, account_equity=available_cash, risk_percent=risk_percent_env, max_investment=max_investment)
+
+                if sizing.get("quantity", 0) == 0:
+                    return {
+                        "error": "Risk-based sizing resulted in zero quantity",
+                        "symbol": symbol,
+                        "quantity": 0
+                    }
+
+                quantity = int(sizing["quantity"])
+                actual_investment = quantity * ltp
+
+                print(
+                    f"{Fore.CYAN}{AGENT_ICONS['calculator']} [RISK SIZER] {symbol}: LTP={ltp}, Stop={stop_price_buy}, Quantity={quantity}, Investment=Rs.{actual_investment:.2f}{Style.RESET_ALL}",
+                    flush=True
+                )
+
+                return {
+                    "symbol": symbol,
+                    "ltp": round(ltp, 2),
+                    "quantity": quantity,
+                    "max_investment": max_investment,
+                    "actual_investment": round(actual_investment, 2),
+                    "stop_loss": stop_price_buy,
+                    "risk_amount": round(sizing.get("risk_amount", 0), 2),
+                    "per_share_risk": round(sizing.get("per_share_risk", 0), 2),
+                    "formula": f"risk_percent={risk_percent_env}, risk_amount={round(sizing.get('risk_amount',0),2)}",
+                    "success": True
+                }
+
+            except Exception as e:
+                print(f"{Fore.YELLOW}[RISK] Could not fetch history/compute ATR: {str(e)}. Falling back to simple sizing.{Style.RESET_ALL}", flush=True)
+
+        # Fallback: simple max_investment / ltp
         quantity = int(max_investment / ltp)
 
         if quantity == 0:
@@ -571,7 +698,11 @@ def calculate_position_size(symbol: str, ltp: float, max_investment: float = 100
         # Calculate actual investment
         actual_investment = quantity * ltp
 
-        print(f"{Fore.CYAN}{AGENT_ICONS['calculator']} [POSITION CALCULATOR] {symbol}: LTP={ltp}, Quantity={quantity}, Investment=Rs.{actual_investment:.2f}{Style.RESET_ALL}", flush=True)
+        print(
+            f"{Fore.CYAN}{AGENT_ICONS['calculator']} [POSITION CALCULATOR] {symbol}: LTP={ltp}, Quantity={quantity}, "
+            f"Investment=Rs.{actual_investment:.2f}{Style.RESET_ALL}",
+            flush=True
+        )
 
         return {
             "symbol": symbol,
@@ -658,7 +789,7 @@ def get_current_positions() -> Dict[str, Any]:
 def analyze_past_trades(symbol: str) -> Dict[str, Any]:
     """Analyze historical trade performance for a symbol."""
     symbol_trades = [t for t in trade_state["trade_history"] if t["symbol"] == symbol]
-    
+
     if len(symbol_trades) < 3:
         return {
             "symbol": symbol,
@@ -667,17 +798,17 @@ def analyze_past_trades(symbol: str) -> Dict[str, Any]:
             "win_rate": 0,
             "avg_profit": 0
         }
-    
+
     wins = [t for t in symbol_trades if t.get("pnl", 0) > 0]
     win_rate = len(wins) / len(symbol_trades) if symbol_trades else 0
     avg_profit = sum([t.get("pnl", 0) for t in symbol_trades]) / len(symbol_trades)
-    
+
     # Find patterns
     recent_3 = symbol_trades[-3:]
     recent_success = sum([1 for t in recent_3 if t.get("pnl", 0) > 0])
-    
+
     confidence = "high" if win_rate > 0.6 else "medium" if win_rate > 0.4 else "low"
-    
+
     return {
         "symbol": symbol,
         "total_trades": len(symbol_trades),
@@ -759,6 +890,60 @@ def check_risk_constraints(symbol: str, action: str) -> Dict[str, Any]:
         # Shorting allowed: SELL without position creates short position
         # Covering allowed: BUY to close short position
         # All other cases allowed
+
+        # Additional exposure checks (per-symbol exposure and portfolio exposure)
+        if globals().get("risk") is not None:
+            try:
+                # Build a current positions map for exposure checks
+                current_positions = {}
+                for pos in response.get("data", []):
+                    if int(pos.get("quantity", 0)) != 0:
+                        current_positions[pos["symbol"]] = {"quantity": int(pos.get("quantity", 0)), "ltp": float(pos.get("ltp", 0)), "avg_price": float(pos.get("average_price", 0))}
+
+                # Fetch LTP for symbol to estimate proposed exposure
+                quotes = client.quotes(symbol=symbol, exchange=EXCHANGE)
+                ltp_val = float(quotes.get("data", {}).get("ltp", 0)) if quotes.get("status") == "success" else 0
+                if ltp_val <= 0:
+                    ltp_val = 1.0  # guard
+
+                # Proposed max quantity (conservative): based on max investment per trade
+                proposed_qty = int(MAX_INVESTMENT_PER_TRADE / ltp_val)
+
+                exposure_check = risk.enforce_exposure_limits(current_positions=current_positions, symbol=symbol, proposed_quantity=proposed_qty, ltp=ltp_val, max_per_symbol_investment=MAX_INVESTMENT_PER_TRADE)
+                if not exposure_check.get("allowed", True):
+                    print(f"{Fore.RED}[RISK BLOCKED] {exposure_check.get('reason')}{Style.RESET_ALL}", flush=True)
+                    return {"allowed": False, "reason": exposure_check.get("reason")}
+
+                # Portfolio-level exposure: ensure total invested doesn't exceed a percent of account equity
+                snapshot = get_account_snapshot()
+                equity = float(snapshot.get("available_cash", 0)) + float(snapshot.get("m2m_unrealized", 0))
+                if equity > 0:
+                    current_total = sum(int(p.get("quantity",0)) * float(p.get("ltp",0)) for p in current_positions.values())
+                    if (current_total + (proposed_qty * ltp_val)) > (equity * float(os.getenv("MAX_PORTFOLIO_EXPOSURE_PERCENT", "0.2"))):
+                        reason = "Portfolio exposure limit exceeded"
+                        print(f"{Fore.RED}[RISK BLOCKED] {reason}{Style.RESET_ALL}", flush=True)
+                        return {"allowed": False, "reason": reason}
+
+                # Trailing stops: compute suggested trailing stop (no automatic order placement yet)
+                try:
+                    trail_enabled = os.getenv("TRAILING_STOP_ENABLED", "false").lower() in ("1", "true", "yes")
+                    trail_pct = float(os.getenv("TRAILING_STOP_PERCENT", "0.03"))
+                    if trail_enabled:
+                        # If we have an open position, compute trailing stop based on peak price (best-effort fetch)
+                        pos = current_positions.get(symbol)
+                        if pos:
+                            entry = float(pos.get("avg_price", ltp_val))
+                            # For demonstration, use latest LTP as peak if no history present
+                            peak = max(ltp_val, entry)
+                            candidate_trail = risk.compute_trailing_stop(entry_price=entry, peak_price=peak, trail_percent=trail_pct, action=action)
+                            # Attach suggested trailing stop to response via a debug print
+                            print(f"{Fore.YELLOW}[TRAILING STOP] Suggested for {symbol}: {candidate_trail}{Style.RESET_ALL}", flush=True)
+
+                except Exception as e:
+                    print(f"{Fore.YELLOW}[RISK] Trailing stop check failed: {str(e)} (continuing){Style.RESET_ALL}", flush=True)
+
+            except Exception as e:
+                print(f"{Fore.YELLOW}[RISK] Exposure checks failed: {str(e)} — continuing with other checks{Style.RESET_ALL}", flush=True)
 
     except Exception as e:
         print(f"{Fore.RED}[ERROR] Failed to check positions: {str(e)}{Style.RESET_ALL}", flush=True)
@@ -956,11 +1141,18 @@ def _square_off_all_positions_direct():
         positions_response = client.positionbook()
 
         if positions_response.get("status") != "success":
-            print(f"{Fore.RED}[SQUARE OFF] Failed to get positions: {positions_response}{Style.RESET_ALL}", flush=True)
+            print(
+                f"{Fore.RED}[SQUARE OFF] Failed to get positions: {positions_response}"
+                f"{Style.RESET_ALL}",
+                flush=True
+            )
             return {"success": False, "error": "Failed to get positions"}
 
         positions = positions_response.get("data", [])
-        print(f"{Fore.CYAN}[SQUARE OFF] Found {len(positions)} positions{Style.RESET_ALL}", flush=True)
+        print(
+            f"{Fore.CYAN}[SQUARE OFF] Found {len(positions)} positions{Style.RESET_ALL}",
+            flush=True
+        )
 
         closed_positions = []
         failed_positions = []
@@ -973,7 +1165,11 @@ def _square_off_all_positions_direct():
 
             # Skip if no position (quantity = 0)
             if quantity == 0:
-                print(f"{Fore.CYAN}[SQUARE OFF] {symbol}: No position to close (qty=0){Style.RESET_ALL}", flush=True)
+                print(
+                    f"{Fore.CYAN}[SQUARE OFF] {symbol}: No position to close (qty=0)"
+                    f"{Style.RESET_ALL}",
+                    flush=True
+                )
                 continue
 
             # Determine action (opposite of current position)
@@ -986,7 +1182,11 @@ def _square_off_all_positions_direct():
                 action = "BUY"
                 close_qty = abs(quantity)
 
-            print(f"{Fore.YELLOW}[SQUARE OFF] {symbol}: Closing {quantity} qty with {action} {close_qty}{Style.RESET_ALL}", flush=True)
+            print(
+                f"{Fore.YELLOW}[SQUARE OFF] {symbol}: Closing {quantity} qty with {action} {close_qty}"
+                f"{Style.RESET_ALL}",
+                flush=True
+            )
 
             try:
                 # Place market order to close position
@@ -1002,7 +1202,10 @@ def _square_off_all_positions_direct():
 
                 if order_response.get("status") == "success":
                     order_id = order_response.get("orderid")
-                    print(f"{Fore.GREEN}[SQUARE OFF] {symbol}: Order #{order_id} placed to close position{Style.RESET_ALL}", flush=True)
+                    print(
+                        f"{Fore.GREEN}[SQUARE OFF] {symbol}: Order #{order_id} placed to close position{Style.RESET_ALL}",
+                        flush=True
+                    )
                     closed_positions.append({
                         "symbol": symbol,
                         "quantity": quantity,
@@ -1010,15 +1213,26 @@ def _square_off_all_positions_direct():
                         "order_id": order_id
                     })
                 else:
-                    print(f"{Fore.RED}[SQUARE OFF] {symbol}: Failed to place order - {order_response}{Style.RESET_ALL}", flush=True)
+                    print(
+                        f"{Fore.RED}[SQUARE OFF] {symbol}: Failed to place order - {order_response}"
+                        f"{Style.RESET_ALL}",
+                        flush=True
+                    )
                     failed_positions.append({"symbol": symbol, "error": order_response})
 
             except Exception as e:
-                print(f"{Fore.RED}[SQUARE OFF] {symbol}: Exception - {str(e)}{Style.RESET_ALL}", flush=True)
+                print(
+                    f"{Fore.RED}[SQUARE OFF] {symbol}: Exception - {str(e)}{Style.RESET_ALL}",
+                    flush=True
+                )
                 failed_positions.append({"symbol": symbol, "error": str(e)})
 
         # Summary
-        print(f"\n{Fore.GREEN}[SQUARE OFF] Summary: Closed {len(closed_positions)} positions, Failed {len(failed_positions)} positions{Style.RESET_ALL}", flush=True)
+        print(
+            f"\n{Fore.GREEN}[SQUARE OFF] Summary: Closed {len(closed_positions)} positions, "
+            f"Failed {len(failed_positions)} positions{Style.RESET_ALL}",
+            flush=True
+        )
 
         # Log to trade history
         trade_state["trade_history"].append({
@@ -1221,7 +1435,11 @@ async def run_trading_cycle():
         print(f"{Fore.YELLOW}  Est. Cost:     ${cost:.6f}{Style.RESET_ALL}", flush=True)
         print(f"{Fore.YELLOW}{'='*80}{Style.RESET_ALL}\n", flush=True)
 
-    print(f"\n{Fore.WHITE}{AGENT_ICONS['coordinator']} [RESULT] {final_result.final_output}{Style.RESET_ALL}", flush=True)
+    print(
+        f"\n{Fore.WHITE}{AGENT_ICONS['coordinator']} [RESULT] "
+        f"{final_result.final_output}{Style.RESET_ALL}",
+        flush=True
+    )
 
     print(f"\n{'='*80}", flush=True)
     print("Trading cycle completed.", flush=True)
@@ -1308,7 +1526,7 @@ async def start_autonomous_agent():
 
     # Initialize trading state
     await initialize_trading_state()
-    
+
     # Setup scheduler
     scheduler = AsyncIOScheduler(timezone=IST)
 
@@ -1341,8 +1559,12 @@ async def start_autonomous_agent():
         print("Running initial test cycle...\n", flush=True)
         await run_trading_cycle()
     else:
-        print(f"{Fore.YELLOW}Outside market hours ({MARKET_OPEN_HOUR}:{MARKET_OPEN_MINUTE:02d} AM - {SQUARE_OFF_HOUR}:{SQUARE_OFF_MINUTE:02d} PM). Waiting for next scheduled run.{Style.RESET_ALL}\n", flush=True)
-    
+        print(
+            f"{Fore.YELLOW}Outside market hours ({MARKET_OPEN_HOUR}:{MARKET_OPEN_MINUTE:02d} AM - "
+            f"{SQUARE_OFF_HOUR}:{SQUARE_OFF_MINUTE:02d} PM). Waiting for next scheduled run.{Style.RESET_ALL}\n",
+            flush=True
+        )
+
     # Keep running
     try:
         await asyncio.Event().wait()
